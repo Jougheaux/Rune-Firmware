@@ -10,7 +10,7 @@
 #include "drv/drv824xs.h"
 #include "led/ws2812.h"
 
-//#define USE_RPM_LOGGING
+#define USE_RPM_LOGGING
 
 void init();
 void uprintf(const char* format, ...);
@@ -30,8 +30,8 @@ DRV::DRV824xS drv = DRV::DRV824xS(DRV_EN, DRV_PH, DRV_NSLEEP, DRV_MOSI, DRV_MISO
 // instantiate esc objects
 #define NUM_MOTORS 2
 Motor::BIDSHOTMotor motors[NUM_MOTORS] {
-  Motor::BIDSHOTMotor(ESC_M1, pio0, Motor::DSHOT600, 14),
-  Motor::BIDSHOTMotor(ESC_M2, pio0, Motor::DSHOT600, 14)
+  Motor::BIDSHOTMotor(ESC_M3, pio0, Motor::DSHOT600, 14),
+  Motor::BIDSHOTMotor(ESC_M4, pio0, Motor::DSHOT600, 14)
 };
 
 // various switches on the blaster
@@ -44,27 +44,37 @@ Debounce::Button rev = Debounce::Button(IO3, true, true);
 // defining fire modes
 struct firemode_t {
   uint32_t targetRPM[NUM_MOTORS];
+  uint32_t fireRPM[NUM_MOTORS];
+  uint32_t idleRPM;
+  int64_t idleTime;
   uint8_t numShots; // there is no way you need more than like 200
   uint8_t burstMode; //what happens when trigger is released
 };
 
 // stuctured as boot/firing mode 1, 2,3
 uint32_t VariableFPS[3] = {14000, 24000, 45000};
+uint32_t predictiveFiringFPS[3] = {1000, 7500, 40000}; //rpm to start the rotation of the pusher, default recommended is 500 rpm less than desired RPM setting
 uint8_t burstSize[3] = {1,3,100}; //maximum amount of darts fired per trigger pull
 uint8_t burstMode[3] = {1, 1, 0}; //0 for trigger release ends burst, 1 for finish burst amount
 
+uint32_t idleRPM = 1000;
+int64_t idleDelay[3] = {0,0,20*1000000}; //microseconds
+
 uint32_t SET_RPM; // convenience bc for now i only want one fps setting
+uint32_t SHOOT_RPM; //stores the RPM for each motor to shoot at
+uint32_t IDLE_TIME; //stores idles times
 uint8_t shotsFired = 0; // so we know how far into a burst we are
 
-struct firemode_t firemode_one = { {SET_RPM, SET_RPM}, 1, 1};
-struct firemode_t firemode_two = { {SET_RPM, SET_RPM}, 3, 1};
-struct firemode_t firemode_three = { {SET_RPM, SET_RPM}, 100, 0}; 
+struct firemode_t firemode_one = { {SET_RPM, SET_RPM}, {SHOOT_RPM, SHOOT_RPM}, idleRPM, 0, 1, 1};
+struct firemode_t firemode_two = { {SET_RPM, SET_RPM}, {SHOOT_RPM, SHOOT_RPM}, idleRPM, 0, 3, 1};
+struct firemode_t firemode_three = { {SET_RPM, SET_RPM}, {SHOOT_RPM, SHOOT_RPM}, idleRPM, 0, 100, 0}; 
 struct firemode_t* firemode_curr = &firemode_one; // pointer to current fire mode
 
 // blaster state variables
 wheelState_t wheelState; // this gets set in the init function so that the timestamp is in sync
 pusherState_t pusherState = STOPPED;
 absolute_time_t lastWheelStateUpdate;
+absolute_time_t lastPusherCycle;
 
 // helper variables for PID control
 // these pid values work for the most part. not the greatest, but better than nothing lol
@@ -84,7 +94,7 @@ int32_t mainLoopTimeus = 1e6 / mainLoopFrequency; // main logic loop time in us
 
 // rpm logging
 #ifdef USE_RPM_LOGGING
-const uint32_t rpmLogLength = 2000;
+const uint32_t rpmLogLength = 6000;
 uint32_t rpmCache[rpmLogLength][NUM_MOTORS] = {0};
 uint16_t throttleCache[rpmLogLength][NUM_MOTORS] = {0}; // float gets converted to an integer [0, 1999]
 uint16_t cacheIndex = rpmLogLength + 1;
@@ -134,17 +144,23 @@ void init() {
 
    if (sel1.isPressed()) { // forward position
     SET_RPM = VariableFPS[0];
+    SHOOT_RPM = predictiveFiringFPS[0];
+    IDLE_TIME = idleDelay[0];
   }
   else if (sel2.isPressed()) { // backward position
     SET_RPM = VariableFPS[2];
+    SHOOT_RPM = predictiveFiringFPS[2];
+    IDLE_TIME = idleDelay[2];
   }
   else { // middle position
     SET_RPM = VariableFPS[1];
+    SHOOT_RPM = predictiveFiringFPS[1];
+    IDLE_TIME = idleDelay[1];
   }
 
-  firemode_one = { {SET_RPM, SET_RPM}, burstSize[0], burstMode[0]};
-  firemode_two = { {SET_RPM, SET_RPM}, burstSize[1], burstMode[1]};
-  firemode_three = { {SET_RPM, SET_RPM}, burstSize[2], burstMode[2]};
+  firemode_one = { {SET_RPM, SET_RPM}, {SHOOT_RPM, SHOOT_RPM}, idleRPM, IDLE_TIME, burstSize[0], burstMode[0]};
+  firemode_two = { {SET_RPM, SET_RPM}, {SHOOT_RPM, SHOOT_RPM}, idleRPM, IDLE_TIME, burstSize[1], burstMode[1]};
+  firemode_three = { {SET_RPM, SET_RPM}, {SHOOT_RPM, SHOOT_RPM}, idleRPM, IDLE_TIME, burstSize[2], burstMode[2]};
 
 
 }
@@ -227,11 +243,44 @@ bool motorControlLoop(repeating_timer_t *rt) {
       else {
         targetRPM = firemode_curr->targetRPM[i] - rpmOffset;
       }
+
+      if(targetRPM <= firemode_curr->idleRPM && firemode_curr->idleTime>0){
+        updateWheelState(PREREV);
+        lastWheelStateUpdate = get_absolute_time();
+      }
+
       throttlePoint[i] = updatePID(&mPID[i], targetRPM, rpm);
+
+      
+    }
+
+    else if (wheelState == PREREV){
+      int64_t delay;
+      delay = firemode_curr->idleTime;
+      if(absolute_time_diff_us(lastWheelStateUpdate, get_absolute_time())<delay){
+        throttlePoint[i] = updatePID(&mPID[i], firemode_curr->idleRPM, rpm);
+      }
+      else{
+        throttlePoint[i] = updatePID(&mPID[i], 0, rpm);
+      }
+      /** 
+      else{
+        int32_t rpmOffset = (int32_t)((firemode_curr->idleRPM / (float)rampDownTime) * absolute_time_diff_us(lastWheelStateUpdate, get_absolute_time())+(firemode_curr->targetRPM[i]-firemode_curr->idleRPM));
+        uint32_t targetRPM;
+        if (rpmOffset > firemode_curr->targetRPM[i]) {
+          targetRPM = 0;
+        }
+        else {
+          targetRPM = firemode_curr->targetRPM[i] - rpmOffset;
+        }
+
+        throttlePoint[i] = updatePID(&mPID[i], targetRPM, rpm);
+      }**/
+
     }
     else if (wheelState == ACCELERATING) {
       throttlePoint[i] = updatePID(&mPID[i], firemode_curr->targetRPM[i], rpm);
-      if (rpm > firemode_curr->targetRPM[i] - 500) {
+      if (rpm > firemode_curr->fireRPM[i]) {
         atTarget |= 1 << i;
       } // set bit if around target rpm
     }
@@ -272,6 +321,10 @@ bool motorControlLoop(repeating_timer_t *rt) {
   else if (wheelState == SLOWING) {
     // switch state to idle if we have been slowing down for longer than rampDownTime; throttle should be 0 by now
     if (absolute_time_diff_us(lastWheelStateUpdate, get_absolute_time()) >= rampDownTime) updateWheelState(IDLE);
+  }
+  else if (wheelState == PREREV){
+    // switch state to idle if we have been slowing down for longer than rampDownTime; throttle should be 0 by now
+    if (absolute_time_diff_us(lastWheelStateUpdate, get_absolute_time()) >= firemode_curr->idleTime) updateWheelState(IDLE);
   }
 
   return true;
@@ -356,6 +409,7 @@ bool systemControlLoop(repeating_timer_t *rt) {
       if ((shotsFired >= firemode_curr->numShots) || ((!trig.isPressed()) && (firemode_curr->burstMode == 0))) {
         // stop the pusher if we've finished the burst or let go of the trigger
         pusherState = STOPPED;
+        uprintf("INFO: pusher return delay: %ums\r\n", to_ms_since_boot(get_absolute_time()) - to_ms_since_boot(lastWheelStateUpdate));
         updateWheelState(SLOWING); // and tell the wheels to slow down too
       }
     }

@@ -5,7 +5,8 @@ enum wheelState_t {
     IDLE,
     ACCELERATING,
     STEADY,
-    SLOWING
+    SLOWING,
+    PREREV
 };
 
 enum pusherState_t {
